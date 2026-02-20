@@ -1,0 +1,229 @@
+#include <algorithm>
+#include <cmath>
+#include <memory>
+#include <string>
+
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/joy.hpp"
+#include "geometry_msgs/msg/twist.hpp"
+#include "std_msgs/msg/color_rgba.hpp"
+
+using std::placeholders::_1;
+
+class GamepadTeleop : public rclcpp::Node {
+  
+public:
+  GamepadTeleop() : Node("gamepad_teleop") {
+    // Topics
+    declare_parameter<std::string>("joy_topic", "/joy");
+    declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
+    declare_parameter<std::string>("led_topic", "/qbot_led_strip");
+
+    // Speeds
+    declare_parameter<double>("max_linear", 0.40);
+    declare_parameter<double>("max_angular", 1.20);
+    declare_parameter<double>("deadzone", 0.08);
+
+    // Mapping (Xbox common)
+    declare_parameter<int>("btn_arm", 0);   // A
+    declare_parameter<int>("btn_kill", 2);  // X
+    declare_parameter<int>("btn_half", 5);  // RB
+    declare_parameter<int>("axis_linear", 1);
+    declare_parameter<int>("axis_angular", 0);
+
+    // Keepalive LED publishing (prevents blinking)
+    declare_parameter<double>("led_keepalive_hz", 10.0);
+
+    // Load params
+    joy_topic_     = get_parameter("joy_topic").as_string();
+    cmd_vel_topic_ = get_parameter("cmd_vel_topic").as_string();
+    led_topic_     = get_parameter("led_topic").as_string();
+
+    max_linear_  = get_parameter("max_linear").as_double();
+    max_angular_ = get_parameter("max_angular").as_double();
+    deadzone_    = get_parameter("deadzone").as_double();
+
+    btn_arm_   = get_parameter("btn_arm").as_int();
+    btn_kill_  = get_parameter("btn_kill").as_int();
+    btn_half_  = get_parameter("btn_half").as_int();
+
+    axis_linear_  = get_parameter("axis_linear").as_int();
+    axis_angular_ = get_parameter("axis_angular").as_int();
+
+    led_keepalive_hz_ = get_parameter("led_keepalive_hz").as_double();
+
+    // Pub/Sub
+    pub_cmd_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, 10);
+    pub_led_ = create_publisher<std_msgs::msg::ColorRGBA>(led_topic_, 10);
+
+    sub_joy_ = create_subscription<sensor_msgs::msg::Joy>(
+      joy_topic_, 10, std::bind(&GamepadTeleop::onJoy, this, _1));
+
+    // Subscribe to the REAL cmd_vel and use that to drive LED decisions
+    sub_cmd_ = create_subscription<geometry_msgs::msg::Twist>(
+      cmd_vel_topic_, 10, std::bind(&GamepadTeleop::onCmdVel, this, _1));
+
+    // Initialize
+    last_cmd_seen_.linear.x = 0.0;
+    last_cmd_seen_.angular.z = 0.0;
+
+    // LED keepalive timer
+    int period_ms = (led_keepalive_hz_ > 0.0) ? (int)(1000.0 / led_keepalive_hz_) : 100;
+    led_timer_ = create_wall_timer(
+      std::chrono::milliseconds(period_ms),
+      std::bind(&GamepadTeleop::publish_led_keepalive, this));
+
+    RCLCPP_INFO(get_logger(), "gamepad_teleop started.");
+    RCLCPP_INFO(get_logger(), "Joy: %s | CmdVel: %s | LED: %s",
+                joy_topic_.c_str(), cmd_vel_topic_.c_str(), led_topic_.c_str());
+    RCLCPP_INFO(get_logger(), "ARM btn=%d, HALF btn=%d (hold), E-STOP btn=%d",
+                btn_arm_, btn_half_, btn_kill_);
+  }
+
+private:
+  static double apply_deadzone(double v, double dz) {
+    return (std::fabs(v) < dz) ? 0.0 : v;
+  }
+
+  void publish_stop_cmd() {
+    geometry_msgs::msg::Twist t;
+    pub_cmd_->publish(t);
+  }
+
+  void publish_led(float r, float g, float b) {
+    std_msgs::msg::ColorRGBA c;
+    c.r = r; c.g = g; c.b = b; c.a = 1.0f;
+    pub_led_->publish(c);
+  }
+
+  void set_led_from_twist(const geometry_msgs::msg::Twist &t) {
+    const double lin = t.linear.x;
+    const double ang = t.angular.z;
+
+    if (std::fabs(lin) < 1e-3 && std::fabs(ang) < 1e-3) {
+      publish_led(1.0f, 1.0f, 0.0f);  // yellow stop
+    } else if (lin > 0.0) {
+      publish_led(0.0f, 1.0f, 0.0f);  // green forward
+    } else if (lin < 0.0) {
+      publish_led(0.0f, 0.0f, 1.0f);  // blue backward
+    } else {
+      publish_led(1.0f, 0.5f, 0.0f);  // orange rotate
+    }
+  }
+
+  void publish_led_keepalive() {
+    // Keep publishing the LED corresponding to the latest cmd_vel observed on the topic
+    set_led_from_twist(last_cmd_seen_);
+  }
+
+  void onCmdVel(const geometry_msgs::msg::Twist::SharedPtr msg) {
+    // Save the latest command seen on /cmd_vel (could be from this node or any other)
+    last_cmd_seen_ = *msg;
+  }
+
+  void stop_and_disarm() {
+    armed_ = false;
+    publish_stop_cmd();
+    last_cmd_seen_.linear.x = 0.0;
+    last_cmd_seen_.angular.z = 0.0;
+    set_led_from_twist(last_cmd_seen_);
+  }
+
+  void onJoy(const sensor_msgs::msg::Joy::SharedPtr msg) {
+    // Safety checks
+    const int need_btn = std::max({btn_arm_, btn_kill_, btn_half_});
+    const int need_ax  = std::max(axis_linear_, axis_angular_);
+    if ((int)msg->buttons.size() <= need_btn || (int)msg->axes.size() <= need_ax) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Joy missing axes/buttons. buttons=%zu axes=%zu",
+                           msg->buttons.size(), msg->axes.size());
+      return;
+    }
+
+    const bool arm_pressed  = (msg->buttons[btn_arm_]  == 1);
+    const bool kill_pressed = (msg->buttons[btn_kill_] == 1);
+    const bool half_pressed = (msg->buttons[btn_half_] == 1);
+
+    // ARM toggle (rising edge)
+    if (arm_pressed && !arm_prev_) {
+      armed_ = !armed_;
+      RCLCPP_INFO(get_logger(), "Armed = %s", armed_ ? "true" : "false");
+      if (!armed_) stop_and_disarm();
+    }
+    arm_prev_ = arm_pressed;
+// HALF-SPEED TOGGLE (press once to toggle on/off)
+if (half_pressed && !half_prev_) {
+    half_speed_ = !half_speed_;
+    RCLCPP_INFO(get_logger(), "Half speed mode = %s",
+                half_speed_ ? "ON" : "OFF");
+}
+half_prev_ = half_pressed;
+
+    // E-STOP (rising edge)
+    if (kill_pressed && !kill_prev_) {
+      RCLCPP_WARN(get_logger(), "E-STOP pressed: stopping + disarming. Press ARM to resume.");
+      stop_and_disarm();
+      kill_prev_ = kill_pressed;
+      return;
+    }
+    kill_prev_ = kill_pressed;
+
+    if (!armed_) {
+      // When disarmed, keep stop command (driver may ignore repeats; ok)
+      publish_stop_cmd();
+      return;
+    }
+
+    // Compute cmd_vel from joystick
+    const double lin_axis = apply_deadzone(msg->axes[axis_linear_], deadzone_);
+    const double ang_axis = apply_deadzone(msg->axes[axis_angular_], deadzone_);
+
+    double lin = lin_axis * max_linear_;
+    double ang = ang_axis * max_angular_;
+if (half_speed_) {
+    lin *= 0.5;
+    ang *= 0.5;
+}
+
+
+    geometry_msgs::msg::Twist t;
+    t.linear.x  = lin;
+    t.angular.z = ang;
+    pub_cmd_->publish(t);
+    // LED is NOT set here; it will be set from actual /cmd_vel via onCmdVel + keepalive timer.
+  }
+
+  // Params
+  std::string joy_topic_;
+  std::string cmd_vel_topic_;
+  std::string led_topic_;
+
+  double max_linear_{0.40};
+  double max_angular_{1.20};
+  double deadzone_{0.08};
+  double led_keepalive_hz_{10.0};
+
+  int btn_arm_{0}, btn_kill_{2}, btn_half_{5};
+  int axis_linear_{1}, axis_angular_{0};
+
+  // State
+  bool armed_{false};
+  bool arm_prev_{false};
+  bool kill_prev_{false};
+
+  geometry_msgs::msg::Twist last_cmd_seen_;
+
+  // ROS
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_;
+  rclcpp::Publisher<std_msgs::msg::ColorRGBA>::SharedPtr pub_led_;
+  rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr sub_joy_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_cmd_;
+  rclcpp::TimerBase::SharedPtr led_timer_;
+};
+
+int main(int argc, char **argv) {
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<GamepadTeleop>());
+  rclcpp::shutdown();
+  return 0;
+}
